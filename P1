@@ -1,0 +1,79 @@
+//+------------------------------------------------------------------+
+//|                                                          C8_7.mq5|
+//|                                  Copyright 2026, High-Perf Trader|
+//+------------------------------------------------------------------+
+#property copyright "High-Perf Trader"
+#property version   "8.70"
+#property strict
+
+#include <Trade\Trade.mqh>
+CTrade trade;
+
+// ==================== INPUT PARAMETERS ====================
+input group "--- Timeframe Settings (M15 Base Engine) ---"
+input string   InpTimeFrame            = "M15";      // Base Execution Timeframe
+
+input group "--- TP / SL Points ---"
+input string   InpTP_Points            = "300";      // Take Profit (Points)
+input string   InpSL_Points            = "200";      // Stop Loss (Points)
+
+input group "--- C8.7 SMART PEAK DROP GUARD SETTINGS ---"
+input string   InpUsePeakDropGuard     = "true";     // Enable Peak Drop Safety Guard (true/false)
+input string   InpMinProfitToActivate  = "1.00";     // Min Profit Threshold to Activate Safety Guard (GBP)
+input string   InpMaxAllowedDropPct    = "15.0";     // Max Allowed Drop % from Peak before Emergency Close
+
+input group "--- Risk Management ---"
+input string   InpRiskPercent          = "0.4";      // Risk % per Trade
+input string   InpDailyMaxLossPercent  = "5.0";      // Daily Max Loss Limit % (คุม % ขาดทุนสูงสุด/วัน)
+input string   InpDailyMaxProfitPercent= "10.0";     // Daily Max Profit Target % (คุม % กำไรเป้าหมาย/วัน)
+
+input group "--- Consecutive Loss Pause Safeguard ---"
+input string   InpMaxConsecutiveLosses = "3";        // Max Consecutive Losses allowed
+input string   InpLossPauseTime        = "01:00:00"; // Pause duration after max losses (HH:MM:SS)
+
+input group "--- News Filter Settings ---"
+input string   InpNewsFilterActive     = "true";     // Enable News Safeguard (true/false)
+input string   InpNewsBufferMinutes    = "30";       // Minutes Before/After High-Impact News
+
+input group "--- Continuous Trading & AI Retry ---"
+input string   InpAlwaysActive         = "true";     // Always Active Mode (24/7 Continuous Search)
+input string   InpTotalAIs             = "80";       // Total Entry AI Count (80)
+input string   InpMajorityThresh       = "56";       // 70% Consensus Threshold (56/80)
+input string   InpMaxRetries           = "10";       // Max Retries before Cooldown (if AlwaysActive=false)
+input string   InpCooldownTime         = "00:03:00"; // Short Cooldown (3 minutes)
+
+// ==================== GLOBAL VARIABLES ====================
+int             g_retryCount = 0;
+datetime        g_cooldownUntil = 0;
+datetime        g_lossPauseUntil = 0;
+double          g_dayStartBalance = 0;
+int             g_currentDay = -1;
+int             g_consecutiveLosses = 0;
+
+// Peak Drop Tracker
+double          g_peakProfit = 0.0;
+bool            g_guardActive = false;
+
+ENUM_TIMEFRAMES g_tfMicro = PERIOD_M5;
+ENUM_TIMEFRAMES g_tfBase  = PERIOD_M15;
+ENUM_TIMEFRAMES g_tfMid   = PERIOD_H1;
+ENUM_TIMEFRAMES g_tfHigh  = PERIOD_H4;
+
+double   g_riskPercent = 0.4;
+double   g_dailyMaxLossPercent = 5.0;
+double   g_dailyMaxProfitPercent = 10.0;
+int      g_tpPoints = 300;
+int      g_slPoints = 200;
+int      g_majorityThresh = 56;
+int      g_maxRetries = 10;
+int      g_cooldownSeconds = 180;
+bool     g_newsFilterActive = true;
+int      g_newsBufferMinutes = 30;
+bool     g_alwaysActive = true;
+
+bool     g_usePeakDropGuard = true;
+double   g_minProfitToActivate = 1.00;
+double   g_maxAllowedDropPct = 15.0;
+
+int      g_maxConsecutiveLosses = 3;
+int      g_lossPauseSeconds = 3600;
