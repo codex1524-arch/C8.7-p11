@@ -1,0 +1,393 @@
+//+------------------------------------------------------------------+
+//| Parse Time Text String into Seconds                              |
+//+------------------------------------------------------------------+
+int ParseTimeToSeconds(string timeStr)
+  {
+   string parts[];
+   ushort u_sep = StringGetCharacter(":", 0);
+   int count = StringSplit(timeStr, u_sep, parts);
+   if(count == 3)
+      return (int)StringToInteger(parts[0]) * 3600 + (int)StringToInteger(parts[1]) * 60 + (int)StringToInteger(parts[2]);
+   else if(count == 2)
+      return (int)StringToInteger(parts[0]) * 3600 + (int)StringToInteger(parts[1]) * 60;
+   return 180;
+  }
+
+//+------------------------------------------------------------------+
+//| Helper: Get Market Session Details & Weight Factor               |
+//+------------------------------------------------------------------+
+void GetMarketSessionDetails(string &sessionName, double &sessionWeight, bool &isHighVol)
+  {
+   MqlDateTime dt;
+   TimeToStruct(TimeGMT(), dt);
+   int hour = dt.hour;
+
+   bool sydney  = (hour >= 22 || hour < 7);
+   bool tokyo   = (hour >= 0 && hour < 9);
+   bool london  = (hour >= 8 && hour < 16);
+   bool newyork = (hour >= 13 && hour < 21);
+
+   sessionName = "";
+   sessionWeight = 1.0;
+   isHighVol = false;
+
+   if(sydney)  sessionName += "Sydney ";
+   if(tokyo)   sessionName += "Tokyo ";
+   if(london)  sessionName += "London ";
+   if(newyork) sessionName += "NewYork ";
+
+   if(sessionName == "") sessionName = "Off-Hours / Transition";
+
+   if(london && newyork)
+     {
+      sessionName += "🔥 [HIGH VOLATILITY OVERLAP]";
+      sessionWeight = 1.2; 
+      isHighVol = true;
+     }
+   else if(tokyo && london)
+     {
+      sessionName += "⚡ [ASIAN-EURO OVERLAP]";
+      sessionWeight = 1.1;
+      isHighVol = true;
+     }
+   else if(sydney || (tokyo && !london))
+     {
+      sessionWeight = 0.9;
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| Helper: Check Last Closed Trade Result                           |
+//+------------------------------------------------------------------+
+void UpdateConsecutiveLossTracker()
+  {
+   uint totalDeals = HistoryDealsTotal();
+   if(!HistorySelect(0, TimeCurrent())) return;
+   
+   totalDeals = HistoryDealsTotal();
+   for(int i = (int)totalDeals - 1; i >= 0; i--)
+     {
+      ulong ticket = HistoryDealGetTicket(i);
+      if(ticket > 0)
+        {
+         long entry = HistoryDealGetInteger(ticket, DEAL_ENTRY);
+         string symbol = HistoryDealGetString(ticket, DEAL_SYMBOL);
+         
+         if(entry == DEAL_ENTRY_OUT && symbol == _Symbol)
+           {
+            double profit = HistoryDealGetDouble(ticket, DEAL_PROFIT);
+            double swap = HistoryDealGetDouble(ticket, DEAL_SWAP);
+            double comm = HistoryDealGetDouble(ticket, DEAL_COMMISSION);
+            double totalPnL = profit + swap + comm;
+
+            if(totalPnL < 0)
+              {
+               g_consecutiveLosses++;
+               if(g_consecutiveLosses >= g_maxConsecutiveLosses)
+                 {
+                  g_lossPauseUntil = TimeCurrent() + g_lossPauseSeconds;
+                 }
+              }
+            else if(totalPnL > 0)
+              {
+               g_consecutiveLosses = 0;
+              }
+            break;
+           }
+        }
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| Helper: Analyze Candlestick Pattern                              |
+//+------------------------------------------------------------------+
+int AnalyzeCandlePattern(ENUM_TIMEFRAMES tf)
+  {
+   MqlRates rates[];
+   ArraySetAsSeries(rates, true);
+   if(CopyRates(_Symbol, tf, 1, 2, rates) < 2) return 0;
+
+   double open1  = rates[0].open;
+   double close1 = rates[0].close;
+   double high1  = rates[0].high;
+   double low1   = rates[0].low;
+
+   double open2  = rates[1].open;
+   double close2 = rates[1].close;
+
+   double range1 = high1 - low1;
+
+   // Bullish Engulfing
+   if(close2 < open2 && close1 > open1 && close1 >= open2 && open1 <= close2)
+      return 1;
+
+   // Bearish Engulfing
+   if(close2 > open2 && close1 < open1 && close1 <= open2 && open1 >= close2)
+      return -1;
+
+   // Pin Bar / Hammer
+   if(range1 > 0)
+     {
+      double lowerWick = MathMin(open1, close1) - low1;
+      double upperWick = high1 - MathMax(open1, close1);
+
+      if(lowerWick / range1 >= 0.6) return 1;
+      if(upperWick / range1 >= 0.6) return -1;
+     }
+
+   if(close1 > open1) return 1;
+   if(close1 < open1) return -1;
+
+   return 0;
+  }
+
+//+------------------------------------------------------------------+
+//| Helper: Analyze Fundamental / High-Impact News Buffer           |
+//+------------------------------------------------------------------+
+int AnalyzeNewsEvents()
+  {
+   if(!g_newsFilterActive) return 0;
+
+   datetime now = TimeCurrent();
+   MqlCalendarValue values[];
+   
+   datetime fromTime = now - (g_newsBufferMinutes * 60);
+   datetime toTime   = now + (g_newsBufferMinutes * 60);
+
+   int count = CalendarValueHistoryByEvent(values, fromTime, toTime);
+   
+   if(count > 0)
+     {
+      for(int i = 0; i < count; i++)
+        {
+         MqlCalendarEvent event;
+         if(CalendarEventById(values[i].event_id, event))
+           {
+            if(event.importance == CALENDAR_IMPORTANCE_HIGH)
+              {
+               return -99;
+              }
+           }
+        }
+     }
+   return 1;
+  }
+
+//+------------------------------------------------------------------+
+//| Helper: Analyze Future Chart Pattern / Price Momentum (20 AIs)   |
+//+------------------------------------------------------------------+
+int AnalyzeFutureStructure(ENUM_TIMEFRAMES tf)
+  {
+   MqlRates rates[];
+   ArraySetAsSeries(rates, true);
+   if(CopyRates(_Symbol, tf, 0, 5, rates) < 5) return 0;
+
+   double momentum = rates[0].close - rates[4].close;
+   double avgRange = 0;
+   for(int i = 0; i < 5; i++) avgRange += (rates[i].high - rates[i].low);
+   avgRange /= 5.0;
+
+   if(momentum > avgRange * 1.5 && rates[0].close > rates[1].high) return 1;  
+   if(momentum < -avgRange * 1.5 && rates[0].close < rates[1].low) return -1; 
+
+   if(rates[1].close < rates[1].open && rates[0].close > rates[0].open && rates[0].close > rates[1].high) return 1;
+   if(rates[1].close > rates[1].open && rates[0].close < rates[0].open && rates[0].close < rates[1].low) return -1;
+
+   return 0;
+  }
+
+//+------------------------------------------------------------------+
+//| C8.7 Smart Peak Drop Guard Check (Let it run unless drop > limit)|
+//+------------------------------------------------------------------+
+void CheckPeakDropGuard()
+  {
+   if(!g_usePeakDropGuard || PositionsTotal() == 0) return;
+
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+     {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket > 0 && PositionGetString(POSITION_SYMBOL) == _Symbol)
+        {
+         double currentProfit = PositionGetDouble(POSITION_PROFIT) + PositionGetDouble(POSITION_SWAP);
+
+         // 1. Activate & Update Peak Profit Continuously
+         if(currentProfit >= g_minProfitToActivate)
+           {
+            if(!g_guardActive) g_guardActive = true;
+            if(currentProfit > g_peakProfit) g_peakProfit = currentProfit;
+           }
+
+         // 2. Evaluate Drop Percentage from Peak Profit
+         if(g_guardActive && g_peakProfit > 0)
+           {
+            double dropAmount = g_peakProfit - currentProfit;
+            double dropPct = (dropAmount / g_peakProfit) * 100.0;
+
+            // If drop exceeds max allowed limit -> Emergency Close to lock profit
+            if(dropPct >= g_maxAllowedDropPct)
+              {
+               trade.PositionClose(ticket);
+               Print("🛡️ C8.7 EMERGENCY DROP CLOSED! Peak: ", g_peakProfit, " GBP | Closed at: ", currentProfit, " GBP (Drop: ", DoubleToString(dropPct, 1), "%)");
+               g_peakProfit = 0.0;
+               g_guardActive = false;
+               return;
+              }
+            // Otherwise: Do NOT close! Let it run to TP or wait for further profit expansion.
+           }
+        }
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| Load and Convert Text Inputs to Internal Values                  |
+//+------------------------------------------------------------------+
+void LoadTextInputs()
+  {
+   g_tpPoints              = (int)StringToInteger(InpTP_Points);
+   g_slPoints              = (int)StringToInteger(InpSL_Points);
+   g_riskPercent           = StringToDouble(InpRiskPercent);
+   g_dailyMaxLossPercent   = StringToDouble(InpDailyMaxLossPercent);
+   g_dailyMaxProfitPercent = StringToDouble(InpDailyMaxProfitPercent);
+   g_majorityThresh        = (int)StringToInteger(InpMajorityThresh);
+   g_maxRetries            = (int)StringToInteger(InpMaxRetries);
+   g_cooldownSeconds       = ParseTimeToSeconds(InpCooldownTime);
+   g_newsFilterActive      = (InpNewsFilterActive == "true" || InpNewsFilterActive == "1");
+   g_newsBufferMinutes     = (int)StringToInteger(InpNewsBufferMinutes);
+   g_alwaysActive          = (InpAlwaysActive == "true" || InpAlwaysActive == "1");
+
+   g_usePeakDropGuard      = (InpUsePeakDropGuard == "true" || InpUsePeakDropGuard == "1");
+   g_minProfitToActivate   = StringToDouble(InpMinProfitToActivate);
+   g_maxAllowedDropPct     = StringToDouble(InpMaxAllowedDropPct);
+
+   g_maxConsecutiveLosses  = (int)StringToInteger(InpMaxConsecutiveLosses);
+   g_lossPauseSeconds      = ParseTimeToSeconds(InpLossPauseTime);
+  }
+
+//+------------------------------------------------------------------+
+//| Update Dashboard on Chart                                        |
+//+------------------------------------------------------------------+
+void UpdateDashboard(string status, int buyVotes, int sellVotes, double dailyPnL, string sessionName)
+  {
+   string text = "";
+   text += "===================================\n";
+   text += "   🛡️ C 8.7 (SMART PEAK HOLD ENGINE)\n";
+   text += "===================================\n";
+   text += "ACTIVE SESSION  : " + sessionName + "\n";
+   text += "STATUS          : " + status + "\n";
+   text += "DAILY PnL (%)   : " + DoubleToString(dailyPnL, 2) + "%\n";
+   text += "LOSS STREAK     : " + IntegerToString(g_consecutiveLosses) + " / " + IntegerToString(g_maxConsecutiveLosses) + " Max\n";
+   
+   if(PositionsTotal() > 0 && g_guardActive)
+     {
+      text += "C8.7 HOLD STATUS: RUNNING 📈 (Peak: " + DoubleToString(g_peakProfit, 2) + " GBP | Max Drop Limit: " + DoubleToString(g_maxAllowedDropPct, 1) + "%)\n";
+     }
+   else
+     {
+      text += "C8.7 HOLD STATUS: WAITING (Min Active: " + DoubleToString(g_minProfitToActivate, 2) + " GBP)\n";
+     }
+
+   if(TimeCurrent() < g_lossPauseUntil)
+     {
+      int remainSec = (int)(g_lossPauseUntil - TimeCurrent());
+      text += "PAUSE REMAINING : " + IntegerToString(remainSec / 60) + "m " + IntegerToString(remainSec % 60) + "s\n";
+     }
+   text += "DAILY LIMITS    : Loss -" + DoubleToString(g_dailyMaxLossPercent, 1) + "% | Target +" + DoubleToString(g_dailyMaxProfitPercent, 1) + "%\n";
+   text += "AI CONSENSUS    : BUY " + IntegerToString(buyVotes) + " | SELL " + IntegerToString(sellVotes) + " (Req: " + IntegerToString(g_majorityThresh) + "/80)\n";
+   text += "AI ALLOCATION   : Pattern(20) | TF Trend(20) | News(20) | Future Structure(20)\n";
+   text += "TARGET TP / SL  : " + IntegerToString(g_tpPoints) + " pts / " + IntegerToString(g_slPoints) + " pts\n";
+   text += "RISK PER TRADE  : " + DoubleToString(g_riskPercent, 2) + "%\n";
+   text += "===================================";
+
+   Comment(text);
+  }
+
+//+------------------------------------------------------------------+
+//| 80 AI HYBRID VOTING ENGINE                                       |
+//+------------------------------------------------------------------+
+void GetAIVotes(int &buyVotes, int &sellVotes, string &sessionName)
+  {
+   buyVotes = 0; 
+   sellVotes = 0;
+
+   double sessionWeight = 1.0;
+   bool isHighVol = false;
+   GetMarketSessionDetails(sessionName, sessionWeight, isHighVol);
+
+   // 1. Candlestick & Price Action Pattern AIs (20 AIs)
+   int patternM15 = AnalyzeCandlePattern(g_tfBase);
+   int patternH1  = AnalyzeCandlePattern(g_tfMid);
+   
+   if(patternM15 == 1)       buyVotes += 10;
+   else if(patternM15 == -1) sellVotes += 10;
+
+   if(patternH1 == 1)        buyVotes += 10;
+   else if(patternH1 == -1)  sellVotes += 10;
+
+   // 2. Multi-Timeframe Trend Reading AIs (20 AIs)
+   int trendBuy = 0, trendSell = 0;
+   ENUM_TIMEFRAMES tfs[4] = {PERIOD_M5, PERIOD_M15, PERIOD_H1, PERIOD_H4};
+   for(int i = 0; i < 4; i++)
+     {
+      int handle = iMA(_Symbol, tfs[i], 20, 0, MODE_EMA, PRICE_CLOSE);
+      double maVal[]; ArraySetAsSeries(maVal, true);
+      if(CopyBuffer(handle, 0, 0, 1, maVal) > 0)
+        {
+         double price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+         if(price > maVal[0])      trendBuy += 5;
+         else if(price < maVal[0]) trendSell += 5;
+        }
+      IndicatorRelease(handle);
+     }
+   
+   buyVotes  += trendBuy;
+   sellVotes += trendSell;
+
+   // 3. News & Fundamental Filter AIs (20 AIs)
+   int newsStatus = AnalyzeNewsEvents();
+   if(newsStatus == -99)
+     {
+      buyVotes = 0;
+      sellVotes = 0;
+      return;
+     }
+   else
+     {
+      if(buyVotes > sellVotes)        buyVotes += 20;
+      else if(sellVotes > buyVotes)   sellVotes += 20;
+      else
+        {
+         buyVotes  += 10;
+         sellVotes += 10;
+        }
+     }
+
+   // 4. Future Structure & Momentum Projection AIs (20 AIs)
+   int futureM15 = AnalyzeFutureStructure(g_tfBase);
+   int futureH1  = AnalyzeFutureStructure(g_tfMid);
+
+   if(futureM15 == 1)       buyVotes += 10;
+   else if(futureM15 == -1) sellVotes += 10;
+
+   if(futureH1 == 1)        buyVotes += 10;
+   else if(futureH1 == -1)  sellVotes += 10;
+
+   // Apply Session Weighting adjustment
+   buyVotes  = (int)MathRound(buyVotes * sessionWeight);
+   sellVotes = (int)MathRound(sellVotes * sessionWeight);
+  }
+
+//+------------------------------------------------------------------+
+//| Calculate Lot Size based on Risk % & SL                          |
+//+------------------------------------------------------------------+
+double CalculateRiskLot()
+  {
+   double freeMargin = AccountInfoDouble(ACCOUNT_MARGIN_FREE);
+   double riskAmount = freeMargin * (g_riskPercent / 100.0);
+   double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   
+   if(g_slPoints <= 0 || tickValue <= 0) return minLot;
+
+   double lot = NormalizeDouble(riskAmount / (g_slPoints * tickValue), 2);
+   return (lot < minLot) ? minLot : lot;
+  }
