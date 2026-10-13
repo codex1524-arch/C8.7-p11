@@ -1,0 +1,127 @@
+//+------------------------------------------------------------------+
+//| Expert initialization function                                   |
+//+------------------------------------------------------------------+
+int OnInit()
+  {
+   LoadTextInputs();
+   g_dayStartBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+   UpdateDashboard("INITIALIZING C8.7 HOLD ENGINE...", 0, 0, 0.0, "Detecting...");
+   return(INIT_SUCCEEDED);
+  }
+
+//+------------------------------------------------------------------+
+//| Expert deinitialization function                                 |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+  {
+   Comment("");
+  }
+
+//+------------------------------------------------------------------+
+//| Expert tick function                                             |
+//+------------------------------------------------------------------+
+void OnTick()
+  {
+   MqlDateTime dt;
+   TimeToStruct(TimeCurrent(), dt);
+
+   if(dt.day != g_currentDay)
+     {
+      g_dayStartBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+      g_currentDay = dt.day;
+      g_retryCount = 0;
+      g_cooldownUntil = 0;
+      g_consecutiveLosses = 0;
+     }
+
+   double currentEquity = AccountInfoDouble(ACCOUNT_EQUITY);
+   double dailyPnL = 0.0;
+   if(g_dayStartBalance > 0)
+      dailyPnL = ((currentEquity - g_dayStartBalance) / g_dayStartBalance) * 100.0;
+
+   string sessionName = "";
+
+   // Check Daily Risk Limits
+   if(dailyPnL <= -g_dailyMaxLossPercent)
+     {
+      UpdateDashboard("STOPPED: HIT DAILY MAX LOSS", 0, 0, dailyPnL, "Paused");
+      return;
+     }
+   if(dailyPnL >= g_dailyMaxProfitPercent)
+     {
+      UpdateDashboard("STOPPED: HIT DAILY TARGET", 0, 0, dailyPnL, "Paused");
+      return;
+     }
+
+   // Check Consecutive Loss Pause Rule
+   if(TimeCurrent() < g_lossPauseUntil)
+     {
+      UpdateDashboard("PAUSED: LOSS LIMIT HIT (WAITING TIMER)", 0, 0, dailyPnL, "Paused");
+      return;
+     }
+
+   // Check Cooldown Rule
+   if(!g_alwaysActive && TimeCurrent() < g_cooldownUntil)
+     {
+      UpdateDashboard("COOLDOWN ACTIVE...", 0, 0, dailyPnL, "Cooldown");
+      return;
+     }
+
+   // Check Active Position & Execute C8.7 Peak Drop Guard Check
+   if(PositionsTotal() > 0)
+     {
+      double sessionWeight; bool isHighVol;
+      GetMarketSessionDetails(sessionName, sessionWeight, isHighVol);
+      
+      // RUN C8.7 PEAK DROP GUARD CHECK EVERY TICK
+      CheckPeakDropGuard();
+
+      UpdateDashboard("POSITION ACTIVE (HOLDING)...", 0, 0, dailyPnL, sessionName);
+      return;
+     }
+
+   // Reset Guard Tracker when no active position
+   g_peakProfit = 0.0;
+   g_guardActive = false;
+
+   UpdateConsecutiveLossTracker();
+
+   g_retryCount++;
+   int buyVotes = 0, sellVotes = 0;
+   GetAIVotes(buyVotes, sellVotes, sessionName);
+
+   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   double ask   = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double bid   = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+
+   if(buyVotes >= g_majorityThresh)
+     {
+      UpdateDashboard("EXECUTING BUY ORDER", buyVotes, sellVotes, dailyPnL, sessionName);
+      double lot = CalculateRiskLot();
+      double sl = (g_slPoints > 0) ? ask - (g_slPoints * point) : 0;
+      double tp = (g_tpPoints > 0) ? ask + (g_tpPoints * point) : 0;
+      
+      trade.Buy(lot, _Symbol, ask, sl, tp, "C8.7 Smart Hold Buy");
+      g_retryCount = 0;
+     }
+   else if(sellVotes >= g_majorityThresh)
+     {
+      UpdateDashboard("EXECUTING SELL ORDER", buyVotes, sellVotes, dailyPnL, sessionName);
+      double lot = CalculateRiskLot();
+      double sl = (g_slPoints > 0) ? bid + (g_slPoints * point) : 0;
+      double tp = (g_tpPoints > 0) ? bid - (g_tpPoints * point) : 0;
+      
+      trade.Sell(lot, _Symbol, bid, sl, tp, "C8.7 Smart Hold Sell");
+      g_retryCount = 0;
+     }
+   else
+     {
+      UpdateDashboard("SEARCHING OPPORTUNITY (24/7)...", buyVotes, sellVotes, dailyPnL, sessionName);
+
+      if(!g_alwaysActive && g_retryCount >= g_maxRetries)
+        {
+         g_cooldownUntil = TimeCurrent() + g_cooldownSeconds;
+         g_retryCount = 0;
+        }
+     }
+  }
